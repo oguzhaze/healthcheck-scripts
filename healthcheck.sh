@@ -547,6 +547,22 @@ Amsterdam|iperf-ams-nl.eranium.net}"
 # Bandwidth from the [SUM] receiver line of iperf3 (-P >1) output, e.g. "9.42 Gbits/sec"
 iperf_rate() { awk '/receiver$/{r=$(NF-2)" "$(NF-1); if($1=="[SUM]") s=r} END{print (s!=""?s:r)}'; }
 
+# Run one iperf3 direction with a retry; public servers allow only one test at a time.
+# Args: host [extra flags e.g. -R]. Echoes "rate unit" or empty.
+iperf_run() {
+  local host="$1"; shift
+  local out rate tries=0
+  while (( tries < 2 )); do
+    tries=$((tries+1))
+    out="$(timeout 30 iperf3 -c "$host" -P 8 -t 10 "$@" 2>&1)"
+    rate="$(printf '%s\n' "$out" | iperf_rate)"
+    [[ -n "$rate" ]] && { printf '%s' "$rate"; return 0; }
+    # server busy / transient error -> wait a bit and retry once
+    if printf '%s\n' "$out" | grep -qi 'busy'; then sleep 6; else sleep 2; fi
+  done
+  return 1
+}
+
 run_network_perf() {
   if ! command -v iperf3 >/dev/null 2>&1; then
     echo "iperf3 not installed. Skipping network performance test."
@@ -561,9 +577,10 @@ run_network_perf() {
     echo
     echo "Testing: $label ($host)"
     # Upload: client sends; server's [SUM] receiver line = upload throughput
-    up="$(timeout 25 iperf3 -c "$host" -P 8 -t 10 2>/dev/null | iperf_rate)"
+    up="$(iperf_run "$host")"
+    sleep 2   # let the public server free up before the reverse test
     # Download: -R reverses direction; client's [SUM] receiver line = download throughput
-    down="$(timeout 25 iperf3 -c "$host" -P 8 -t 10 -R 2>/dev/null | iperf_rate)"
+    down="$(iperf_run "$host" -R)"
     # Latency: average RTT from ping summary
     lat="$(ping -c 3 -W 2 "$host" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
     [[ -z "$lat" ]] && lat="$(ping -c 1 -W 2 "$host" 2>/dev/null | sed -nE 's/.*time=([0-9.]+).*/\1/p' | head -1)"
@@ -579,6 +596,7 @@ run_network_perf() {
     else
       echo "(no result - server unreachable or busy)"
     fi
+    sleep 1
   done <<< "$NETPERF_TARGETS"
 
   if (( any )); then
