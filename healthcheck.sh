@@ -536,8 +536,8 @@ cf_speedtest() {
   meta="$(curl -s --max-time 10 https://speed.cloudflare.com/meta 2>/dev/null)"
   down="$(curl -s -o /dev/null --max-time 20 -w '%{speed_download}' \
           "https://speed.cloudflare.com/__down?bytes=${DL_BYTES}" 2>/dev/null)"
-  [[ "$down" =~ ^[0-9.]+$ ]] || return 1
-  awk -v d="$down" 'BEGIN{exit !(d>100000)}' || return 1   # treat as failure if not > ~0.8 Mbps
+  # 'down' may be scientific notation (e.g. 1.18e+09) on fast links; let awk parse it
+  awk -v d="${down:-0}" 'BEGIN{ exit !(d+0 > 100000) }' || return 1   # fail if not > ~0.8 Mbps
   lat="$(curl -s -o /dev/null --max-time 10 -w '%{time_connect}' \
          'https://speed.cloudflare.com/__down?bytes=0' 2>/dev/null)"
   up="$(head -c "$UL_BYTES" /dev/zero 2>/dev/null | curl -s -o /dev/null --max-time 20 \
@@ -552,15 +552,22 @@ cf_speedtest() {
 run_speedtest() {
   local tool="" smode="" dl="" ul="" ping="" srv="" out="" line="" serr="" SPEED_ERR=""
 
-  # 1) Ookla / speedtest-cli first (the user-installed tool; real server location)
-  if command -v speedtest >/dev/null 2>&1 && speedtest --version 2>&1 | grep -qi 'ookla'; then
-    tool="speedtest"; smode="ookla"
-  elif command -v speedtest-cli >/dev/null 2>&1; then
-    tool="speedtest-cli"; smode="python"
-  elif command -v speedtest >/dev/null 2>&1; then
-    tool="speedtest"; smode="python"
+  # 1) Cloudflare (curl) - primary: reliable, no install, returns location
+  echo "Method: Cloudflare (curl)"
+  line="$(cf_speedtest)"
+  [[ -n "$line" ]] && read -r dl ul ping srv <<< "$line"
+
+  # 2) Fallback to Ookla / speedtest-cli only if Cloudflare failed
+  if [[ -z "$dl" || "$dl" == "ERR" ]]; then
+    if command -v speedtest >/dev/null 2>&1 && speedtest --version 2>&1 | grep -qi 'ookla'; then
+      tool="speedtest"; smode="ookla"
+    elif command -v speedtest-cli >/dev/null 2>&1; then
+      tool="speedtest-cli"; smode="python"
+    elif command -v speedtest >/dev/null 2>&1; then
+      tool="speedtest"; smode="python"
+    fi
+    [[ -n "$tool" ]] && echo "Fallback method: $tool ($smode)"
   fi
-  [[ -n "$tool" ]] && echo "Method: $tool ($smode)"
 
   if [[ -z "$dl" && "$smode" == "ookla" ]]; then
     out="$("$tool" -f json --accept-license --accept-gdpr 2>/dev/null)"
@@ -599,13 +606,6 @@ PY
       if [[ -n "$dl" ]]; then srv="unknown"
       else SPEED_ERR="$(echo "$serr" | grep -iE 'error|cannot|unable|HTTP|Exception|Forbidden' | head -1)"; fi
     fi
-  fi
-
-  # 3) Still no result -> Cloudflare (curl) - guaranteed method (no install needed)
-  if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-    echo "Fallback method: Cloudflare (curl)"
-    line="$(cf_speedtest)"
-    [[ -n "$line" ]] && read -r dl ul ping srv <<< "$line"
   fi
 
   if [[ -z "$dl" || "$dl" == "ERR" ]]; then
