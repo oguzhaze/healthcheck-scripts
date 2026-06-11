@@ -5,14 +5,18 @@
 #  - Writes to both screen and file
 #  - Ends with: Health Score + quick summary + detailed status table
 #
+#  Works on Debian/Ubuntu (apt) and CentOS/AlmaLinux/RHEL (dnf/yum).
+#
 #  Usage:
 #     sudo ./healthcheck.sh            # all checks + performance tests
 #     sudo ./healthcheck.sh --json     # summary as JSON (stdout), full log to file
 #     NO_EMOJI=1 ./healthcheck.sh      # plain output without emoji
 #     NO_INSTALL=1 ./healthcheck.sh    # do not auto-install missing packages
+#     NETPERF_TARGETS="London|host\nNYC|host" ./healthcheck.sh   # custom iperf3 targets
 #
-#  Note: when run as root, missing tools (smartmontools, speedtest-cli, fio) are installed first.
-#  Disk write test (fio) and speedtest run on every invocation.
+#  Note: when run as root, missing tools (smartmontools, iperf3, fio) are installed first,
+#  and the smartd monitoring service is enabled.
+#  Disk write test (fio) and iperf3 network test run on every invocation.
 #  Each run also produces a .json summary file (same dir as the log).
 # =============================================================
 
@@ -78,7 +82,7 @@ mark() {
   fi
 }
 
-# Install missing tools (smartmontools first, then speedtest-cli). Requires root + internet.
+# Install missing tools (smartmontools, iperf3, fio) and enable smartd. Requires root + internet.
 install_prereqs() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
   if [[ "$IS_ROOT" -ne 1 ]]; then
@@ -88,27 +92,34 @@ install_prereqs() {
 
   local pkgs=()
   command -v smartctl >/dev/null 2>&1 || pkgs+=("smartmontools")
-  command -v curl >/dev/null 2>&1 || pkgs+=("curl")
-  if ! command -v speedtest-cli >/dev/null 2>&1 && ! command -v speedtest >/dev/null 2>&1; then
-    pkgs+=("speedtest-cli")
-  fi
-  command -v fio >/dev/null 2>&1 || pkgs+=("fio")
-  [[ "${#pkgs[@]}" -eq 0 ]] && return
+  command -v iperf3   >/dev/null 2>&1 || pkgs+=("iperf3")
+  command -v fio      >/dev/null 2>&1 || pkgs+=("fio")
 
-  section "PREREQUISITES"
-  echo "Installing missing tools: ${pkgs[*]}"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq >/dev/null 2>&1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Installation complete (apt)." || echo "Installation failed/skipped (apt)."
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Installation complete (dnf)." || echo "Installation failed (dnf - speedtest-cli may need EPEL)."
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Installation complete (yum)." || echo "Installation failed (yum - speedtest-cli may need EPEL)."
-  else
-    echo "No supported package manager found (apt/dnf/yum)."
+  if [[ "${#pkgs[@]}" -gt 0 ]]; then
+    section "PREREQUISITES"
+    echo "Installing missing tools: ${pkgs[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq >/dev/null 2>&1
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 \
+        && echo "Installation complete (apt)." || echo "Installation failed/skipped (apt)."
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y epel-release >/dev/null 2>&1 || true
+      dnf install -y "${pkgs[@]}" >/dev/null 2>&1 \
+        && echo "Installation complete (dnf)." || echo "Installation failed (dnf)."
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y epel-release >/dev/null 2>&1 || true
+      yum install -y "${pkgs[@]}" >/dev/null 2>&1 \
+        && echo "Installation complete (yum)." || echo "Installation failed (yum)."
+    else
+      echo "No supported package manager found (apt/dnf/yum)."
+    fi
+  fi
+
+  # Enable and start the SMART monitoring daemon (service name differs per distro)
+  if command -v smartctl >/dev/null 2>&1; then
+    if systemctl enable --now smartd >/dev/null 2>&1 || systemctl enable --now smartmontools >/dev/null 2>&1; then
+      echo "smartd service: enabled and running"
+    fi
   fi
 }
 
@@ -522,108 +533,58 @@ print_errors() {
 }
 
 # ---------------------------------------------------------------
-# PERFORMANCE (every run: fio + speedtest + cpu)
+# PERFORMANCE (every run: fio + network (iperf3) + cpu)
 # ---------------------------------------------------------------
-# Format an Mbps value as Mbps/Gbps
-fmt_speed() { awk -v v="$1" 'BEGIN{ if(v>=1000) printf "%.2f Gbps", v/1000; else printf "%.2f Mbps", v }'; }
+# iperf3 test locations as "Label|host" lines. Override with the NETPERF_TARGETS env var.
+# Public iperf3 servers you can use (add/remove as you like):
+#   London|lon.speedtest.clouvider.net      Amsterdam|iperf-ams-nl.eranium.net
+#   Tashkent|speedtest.uztelecom.uz         Singapore|speedtest.sin1.sg.leaseweb.net
+#   Los Angeles|la.speedtest.clouvider.net  New York|speedtest.nyc1.us.leaseweb.net
+#   Sao Paulo|speedtest.sao1.edgoo.net
+NETPERF_TARGETS="${NETPERF_TARGETS:-London|lon.speedtest.clouvider.net
+Amsterdam|iperf-ams-nl.eranium.net}"
 
-# Cloudflare-based speed test (needs only curl, reliable, provides location)
-# Output: "DL_Mbps UL_Mbps PING_ms Location" or empty + return 1 on failure
-cf_speedtest() {
-  command -v curl >/dev/null 2>&1 || return 1
-  local meta down up lat city colo
-  local DL_BYTES=500000000 UL_BYTES=100000000   # ~500MB download, ~100MB upload
-  meta="$(curl -s --max-time 10 https://speed.cloudflare.com/meta 2>/dev/null)"
-  down="$(curl -s -o /dev/null --max-time 20 -w '%{speed_download}' \
-          "https://speed.cloudflare.com/__down?bytes=${DL_BYTES}" 2>/dev/null)"
-  # 'down' may be scientific notation (e.g. 1.18e+09) on fast links; let awk parse it
-  awk -v d="${down:-0}" 'BEGIN{ exit !(d+0 > 100000) }' || return 1   # fail if not > ~0.8 Mbps
-  lat="$(curl -s -o /dev/null --max-time 10 -w '%{time_connect}' \
-         'https://speed.cloudflare.com/__down?bytes=0' 2>/dev/null)"
-  up="$(head -c "$UL_BYTES" /dev/zero 2>/dev/null | curl -s -o /dev/null --max-time 20 \
-        -w '%{speed_upload}' --data-binary @- 'https://speed.cloudflare.com/__up' 2>/dev/null)"
-  city="$(printf '%s' "$meta" | grep -oE '"city":"[^"]*"' | head -1 | sed 's/.*://; s/"//g')"
-  colo="$(printf '%s' "$meta" | grep -oE '"colo":"[^"]*"' | head -1 | sed 's/.*://; s/"//g')"
-  awk -v d="$down" -v u="${up:-0}" -v l="${lat:-0}" -v c="$city" -v k="$colo" \
-    'BEGIN{ s=c; if(s=="")s=k; if(s=="")s="Cloudflare";
-            printf "%.2f %.2f %.2f %s", d*8/1e6, u*8/1e6, l*1000, s }'
-}
+# Bandwidth from the [SUM] receiver line of iperf3 (-P >1) output, e.g. "9.42 Gbits/sec"
+iperf_rate() { awk '/receiver$/{r=$(NF-2)" "$(NF-1); if($1=="[SUM]") s=r} END{print (s!=""?s:r)}'; }
 
-run_speedtest() {
-  local tool="" smode="" dl="" ul="" ping="" srv="" out="" line="" serr="" SPEED_ERR=""
-
-  # 1) Cloudflare (curl) - primary: reliable, no install, returns location
-  echo "Method: Cloudflare (curl)"
-  line="$(cf_speedtest)"
-  [[ -n "$line" ]] && read -r dl ul ping srv <<< "$line"
-
-  # 2) Fallback to Ookla / speedtest-cli only if Cloudflare failed
-  if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-    if command -v speedtest >/dev/null 2>&1 && speedtest --version 2>&1 | grep -qi 'ookla'; then
-      tool="speedtest"; smode="ookla"
-    elif command -v speedtest-cli >/dev/null 2>&1; then
-      tool="speedtest-cli"; smode="python"
-    elif command -v speedtest >/dev/null 2>&1; then
-      tool="speedtest"; smode="python"
-    fi
-    [[ -n "$tool" ]] && echo "Fallback method: $tool ($smode)"
+run_network_perf() {
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "iperf3 not installed. Skipping network performance test."
+    STATUS_SPEED="SKIP"; SUM_SPEED="iperf3 not installed"; return
   fi
 
-  if [[ -z "$dl" && "$smode" == "ookla" ]]; then
-    out="$("$tool" -f json --accept-license --accept-gdpr 2>/dev/null)"
-    if [[ -n "$out" ]] && command -v python3 >/dev/null 2>&1; then
-      read -r dl ul ping srv < <(python3 - "$out" 2>/dev/null <<'PY'
-import sys, json
-try:
-    d=json.loads(sys.argv[1])
-    print("%.2f %.2f %.2f %s" % (d["download"]["bandwidth"]*8/1e6,
-        d["upload"]["bandwidth"]*8/1e6, d["ping"]["latency"],
-        d.get("server",{}).get("location") or d.get("server",{}).get("name") or "unknown"))
-except Exception:
-    print("ERR ERR ERR ERR")
-PY
-)
-    fi
-  elif [[ -z "$dl" && "$smode" == "python" ]]; then
-    out="$("$tool" --secure --json 2>/dev/null)"
-    if [[ -n "$out" ]] && command -v python3 >/dev/null 2>&1; then
-      read -r dl ul ping srv < <(python3 - "$out" 2>/dev/null <<'PY'
-import sys, json
-try:
-    d=json.loads(sys.argv[1]); s=d.get("server",{})
-    print("%.2f %.2f %.2f %s" % (d["download"]/1e6, d["upload"]/1e6, d["ping"],
-        s.get("name") or s.get("sponsor") or "unknown"))
-except Exception:
-    print("ERR ERR ERR ERR")
-PY
-)
-    fi
-    if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-      serr="$("$tool" --secure --simple 2>&1)"
-      dl="$(echo "$serr"   | sed -nE 's/^Download:[[:space:]]+([0-9.]+).*/\1/p')"
-      ul="$(echo "$serr"   | sed -nE 's/^Upload:[[:space:]]+([0-9.]+).*/\1/p')"
-      ping="$(echo "$serr" | sed -nE 's/^Ping:[[:space:]]+([0-9.]+).*/\1/p')"
-      if [[ -n "$dl" ]]; then srv="unknown"
-      else SPEED_ERR="$(echo "$serr" | grep -iE 'error|cannot|unable|HTTP|Exception|Forbidden' | head -1)"; fi
-    fi
-  fi
+  local label host up down lat sumlines="" any=0
+  while IFS='|' read -r label host; do
+    label="$(echo "$label" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    host="$(echo "$host"   | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$host" ]] && continue
+    echo
+    echo "Testing: $label ($host)"
+    # Upload: client sends; server's [SUM] receiver line = upload throughput
+    up="$(timeout 25 iperf3 -c "$host" -P 8 -t 10 2>/dev/null | iperf_rate)"
+    # Download: -R reverses direction; client's [SUM] receiver line = download throughput
+    down="$(timeout 25 iperf3 -c "$host" -P 8 -t 10 -R 2>/dev/null | iperf_rate)"
+    # Latency: average RTT from ping summary
+    lat="$(ping -c 3 -W 2 "$host" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+    [[ -z "$lat" ]] && lat="$(ping -c 1 -W 2 "$host" 2>/dev/null | sed -nE 's/.*time=([0-9.]+).*/\1/p' | head -1)"
+    [[ -n "$lat" ]] && lat="${lat} ms"
 
-  if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-    echo "Speed test could not run.${SPEED_ERR:+ Error: $SPEED_ERR}"
-    STATUS_SPEED="WARN"; SUM_SPEED="${SPEED_ERR:-speedtest unavailable}"; return
-  fi
+    [[ -n "$up" ]]   && echo "Upload   : $up"
+    [[ -n "$down" ]] && echo "Download : $down"
+    [[ -n "$lat" ]]  && echo "Latency  : $lat"
+    if [[ -n "$up" || -n "$down" ]]; then
+      any=1
+      sumlines="${sumlines}${sumlines:+$'\n'}$(printf '%-11s D %s   U %s%s' \
+        "$label" "${down:-n/a}" "${up:-n/a}" "${lat:+   $lat}")"
+    else
+      echo "(no result - server unreachable or busy)"
+    fi
+  done <<< "$NETPERF_TARGETS"
 
-  echo "Server   : ${srv:-unknown}"
-  echo "Download : $(fmt_speed "$dl")"
-  echo "Upload   : $(fmt_speed "$ul")"
-  echo "Latency  : ${ping} ms"
-  STATUS_SPEED="PASS"
-  if [[ -n "$srv" && "$srv" != "unknown" ]]; then
-    printf -v SUM_SPEED 'Server: %s\nDownload: %s\nUpload: %s\nLatency: %s ms' \
-      "$srv" "$(fmt_speed "$dl")" "$(fmt_speed "$ul")" "$ping"
+  if (( any )); then
+    STATUS_SPEED="PASS"; SUM_SPEED="$sumlines"
   else
-    printf -v SUM_SPEED 'Download: %s\nUpload: %s\nLatency: %s ms' \
-      "$(fmt_speed "$dl")" "$(fmt_speed "$ul")" "$ping"
+    STATUS_SPEED="WARN"; SUM_SPEED="all iperf3 servers unreachable"
   fi
 }
 
@@ -638,8 +599,8 @@ print_perf() {
     echo "fio not installed (apt/yum install fio). Skipping."
   fi
 
-  section "PERFORMANCE - INTERNET SPEED (speedtest)"
-  run_speedtest
+  section "PERFORMANCE - NETWORK (iperf3)"
+  run_network_perf
 
   section "PERFORMANCE - CPU"
   if command -v geekbench6 >/dev/null 2>&1; then geekbench6
@@ -738,7 +699,7 @@ print_json() {
     "memory":     { "status": "$STATUS_MEM",     "details": $(json_details "$SUM_MEM") },
     "storage":    { "status": "$STATUS_STORAGE", "details": $(json_details "$SUM_STORAGE") },
     "network":    { "status": "$STATUS_NET",     "details": $(json_details "$SUM_NET") },
-    "speed_test": { "status": "${STATUS_SPEED:-SKIP}", "details": $(json_details "$SUM_SPEED") },
+    "network_perf": { "status": "${STATUS_SPEED:-SKIP}", "details": $(json_details "$SUM_SPEED") },
     "ipv6":       { "status": "$STATUS_IPV6",    "details": $(json_details "$SUM_IPV6") },
     "smart":      { "status": "$STATUS_SMART",   "details": $(json_details "$SUM_SMART") },
     "raid":       { "status": "$STATUS_RAID",    "details": $(json_details "$SUM_RAID") },
@@ -789,7 +750,7 @@ print_summary() {
   sum_line "Network"  "$STATUS_NET"     "$SUM_NET"
   echo
   if [[ -n "$STATUS_SPEED" ]]; then
-    sum_line "Speed Test" "$STATUS_SPEED" "$SUM_SPEED"
+    sum_line "Network Perf" "$STATUS_SPEED" "$SUM_SPEED"
     echo
   fi
   sum_line "IPv6"     "$STATUS_IPV6"    "$SUM_IPV6"
