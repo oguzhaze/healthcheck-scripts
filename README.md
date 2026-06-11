@@ -58,7 +58,7 @@ OS           : Ubuntu 24.04.4 LTS
 CPU          : AMD Ryzen 9 7900
 RAM          : 62 GB
 Storage      : 877 GB
-IPv4         : 85.208.198.210
+IPv4         : 192.0.2.10
 
 -------------------------
  Details
@@ -87,9 +87,9 @@ Storage      : ✅ PASS
                 Free: 829 GB
 
 Network      : ✅ PASS
-                IPv4: 85.208.198.210/29
-                Gateway: 85.208.198.209 ✅ Reachable
-                DNS: 85.208.196.51,85.208.196.52 ✅ Working
+                IPv4: 192.0.2.10/29
+                Gateway: 192.0.2.9 ✅ Reachable
+                DNS: 1.1.1.1,8.8.8.8 ✅ Working
                 Internet: ✅ Connected
 
 Speed Test   : ✅ PASS
