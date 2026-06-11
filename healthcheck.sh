@@ -23,7 +23,7 @@
 set -uo pipefail 2>/dev/null || true
 
 # ---------------------------------------------------------------
-# General Settings
+# Genel ayarlar
 # ---------------------------------------------------------------
 # All tests (disk/speedtest/cpu) run on every invocation.
 
@@ -590,18 +590,19 @@ run_network_perf() {
     [[ -n "$down" ]] && echo "Download : $down"
     [[ -n "$lat" ]]  && echo "Latency  : $lat"
 
-    local line
-    if [[ -n "$up" || -n "$down" ]]; then
-      any=1
-      line="$(printf '%-11s D %s   U %s%s' "$label" "${down:-n/a}" "${up:-n/a}" "${lat:+   $lat}")"
-    elif [[ -n "$lat" ]]; then
-      echo "(iperf3 failed - server busy/unreachable; host responds to ping)"
-      line="$(printf '%-11s D n/a   U n/a   %s' "$label" "$lat")"
+    local block
+    if [[ -n "$up" || -n "$down" || -n "$lat" ]]; then
+      [[ -n "$up" || -n "$down" ]] && any=1
+      [[ -n "$up" || -n "$down" ]] || echo "(iperf3 failed - server busy/unreachable; host responds to ping)"
+      block="$label"
+      block="${block}"$'\n'"  Upload   : ${up:-n/a}"
+      block="${block}"$'\n'"  Download : ${down:-n/a}"
+      block="${block}"$'\n'"  Latency  : ${lat:-n/a}"
     else
       echo "(no result - server unreachable)"
-      line="$(printf '%-11s unreachable' "$label")"
+      block="$label"$'\n'"  unreachable"
     fi
-    sumlines="${sumlines}${sumlines:+$'\n'}${line}"
+    sumlines="${sumlines}${sumlines:+$'\n'}${block}"
     sleep 1
   done <<< "$NETPERF_TARGETS"
 
