@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================
 #  SERVER HEALTHCHECK
-#  - Kurulum sonrası hızlı sağlık + network + disk kontrolü
-#  - Hem ekrana yazar hem dosyaya kaydeder
-#  - Sonunda: Health Score + hızlı özet + detaylı durum tablosu
+#  - Post-install quick health + network + disk check
+#  - Writes to both screen and file
+#  - Ends with: Health Score + quick summary + detailed status table
 #
-#  Kullanım:
-#     sudo ./healthcheck.sh            # tüm kontroller + performans testleri
-#     sudo ./healthcheck.sh --json     # özetin JSON çıktısı (ekrana), log dosyada
-#     NO_EMOJI=1 ./healthcheck.sh      # emoji'siz düz çıktı
-#     NO_INSTALL=1 ./healthcheck.sh    # eksik paketleri otomatik kurma
+#  Usage:
+#     sudo ./healthcheck.sh            # all checks + performance tests
+#     sudo ./healthcheck.sh --json     # summary as JSON (stdout), full log to file
+#     NO_EMOJI=1 ./healthcheck.sh      # plain output without emoji
+#     NO_INSTALL=1 ./healthcheck.sh    # do not auto-install missing packages
 #
-#  Not: root ise eksik araçlar (smartmontools, speedtest-cli, fio) başta kurulur.
-#  Disk yazma testi (fio) ve speedtest her çalıştırmada yapılır.
-#  Her çalıştırma ayrıca .json özet dosyası üretir (log ile aynı dizin).
+#  Note: when run as root, missing tools (smartmontools, speedtest-cli, fio) are installed first.
+#  Disk write test (fio) and speedtest run on every invocation.
+#  Each run also produces a .json summary file (same dir as the log).
 # =============================================================
 
 set -uo pipefail 2>/dev/null || true
@@ -21,7 +21,7 @@ set -uo pipefail 2>/dev/null || true
 # ---------------------------------------------------------------
 # Genel ayarlar
 # ---------------------------------------------------------------
-# Tüm testler (disk/speedtest/cpu) her çalıştırmada yapılır.
+# All tests (disk/speedtest/cpu) run on every invocation.
 
 TS="$(date +%Y%m%d_%H%M%S)"
 if [[ -w /var/log ]]; then
@@ -31,23 +31,23 @@ else
 fi
 JSONFILE="${LOGFILE%.log}.json"
 
-# JSON çıktısı isteniyor mu? (--json)
+# Is JSON output requested? (--json)
 JSON_MODE=0
 for _a in "$@"; do [[ "$_a" == "--json" ]] && JSON_MODE=1; done
 
-# Özet durum değişkenleri
+# Summary status variables
 STATUS_OS="SKIP"; STATUS_NTP="SKIP"; STATUS_CPU="PASS"; STATUS_MEM="PASS"
 STATUS_STORAGE="PASS"; STATUS_NET="SKIP"; STATUS_IPV6="N/A"; STATUS_SMART="SKIP"
 STATUS_RAID="SKIP"; STATUS_SSH="SKIP"; STATUS_FW="INFO"
 
-# Özet detay metinleri (çok satırlı)
+# Summary detail texts (multi-line)
 SUM_OS=""; SUM_TIME=""; SUM_CPU=""; SUM_MEM=""; SUM_STORAGE=""
 SUM_NET=""; SUM_IPV6="IPv6 not configured"; SUM_SMART=""; SUM_RAID=""
 SUM_SSH=""; SUM_FW=""
 STATUS_LOGS="SKIP"; STATUS_DMESG="SKIP"; SUM_LOGS=""; SUM_DMESG=""
 STATUS_SPEED=""; SUM_SPEED=""
 
-# Üst hızlı bilgi
+# Top quick info
 Q_HOST=""; Q_OS=""; Q_CPU=""; Q_RAM=""; Q_STORAGE=""; Q_IPV4=""
 
 WARNINGS=()
@@ -69,7 +69,7 @@ emoji() {
   esac
 }
 
-# Satır içi durum işareti (✅/❌). NO_EMOJI ile düz metin.
+# Inline status mark. Plain text with NO_EMOJI.
 mark() {
   if [[ "${NO_EMOJI:-0}" == "1" ]]; then
     [[ "$1" == "1" ]] && printf 'OK' || printf 'X'
@@ -78,11 +78,11 @@ mark() {
   fi
 }
 
-# Eksik araçları kur (önce smartmontools, sonra speedtest-cli). Root + internet gerekir.
+# Install missing tools (smartmontools first, then speedtest-cli). Requires root + internet.
 install_prereqs() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
   if [[ "$IS_ROOT" -ne 1 ]]; then
-    echo "Paket kurulumu için root gerekli; eksik araç kurulumu atlanıyor."
+    echo "Root required for package installation; skipping tool install."
     return
   fi
 
@@ -96,19 +96,19 @@ install_prereqs() {
   [[ "${#pkgs[@]}" -eq 0 ]] && return
 
   section "PREREQUISITES"
-  echo "Eksik araçlar kuruluyor: ${pkgs[*]}"
+  echo "Installing missing tools: ${pkgs[*]}"
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq >/dev/null 2>&1
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Kurulum tamamlandı (apt)." || echo "Kurulum başarısız/atlandı (apt)."
+      && echo "Installation complete (apt)." || echo "Installation failed/skipped (apt)."
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Kurulum tamamlandı (dnf)." || echo "Kurulum başarısız (dnf - speedtest-cli için EPEL gerekebilir)."
+      && echo "Installation complete (dnf)." || echo "Installation failed (dnf - speedtest-cli may need EPEL)."
   elif command -v yum >/dev/null 2>&1; then
     yum install -y "${pkgs[@]}" >/dev/null 2>&1 \
-      && echo "Kurulum tamamlandı (yum)." || echo "Kurulum başarısız (yum - speedtest-cli için EPEL gerekebilir)."
+      && echo "Installation complete (yum)." || echo "Installation failed (yum - speedtest-cli may need EPEL)."
   else
-    echo "Desteklenen paket yöneticisi yok (apt/dnf/yum)."
+    echo "No supported package manager found (apt/dnf/yum)."
   fi
 }
 
@@ -130,8 +130,8 @@ print_health() {
     STATUS_OS="PASS"
   else
     os_pretty="unknown"
-    echo "OS         : /etc/os-release okunamadı"
-    STATUS_OS="WARN"; add_warn "OS bilgisi okunamadı (/etc/os-release)"
+    echo "OS         : could not read /etc/os-release"
+    STATUS_OS="WARN"; add_warn "Could not read OS info (/etc/os-release)"
   fi
   Q_OS="$os_pretty"
   printf -v SUM_OS '%s\nKernel %s' "$os_pretty" "$kernel"
@@ -147,7 +147,7 @@ print_health() {
     sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
     echo "NTP Sync   : ${sync:-unknown}"
     if [[ "$sync" == "yes" ]]; then STATUS_NTP="PASS"; else
-      STATUS_NTP="WARN"; add_warn "Saat NTP ile senkronize değil"; fi
+      STATUS_NTP="WARN"; add_warn "Clock not synchronized via NTP"; fi
     echo; timedatectl 2>/dev/null
   else
     sync="unknown"; STATUS_NTP="SKIP"
@@ -203,18 +203,18 @@ print_hardware() {
   [[ -z "$st_fs" ]] && st_fs="unknown"
   Q_STORAGE="${st_size} GB"
   if [[ "${st_pct}" =~ ^[0-9]+$ ]] && (( st_pct >= 90 )); then
-    STATUS_STORAGE="WARN"; add_warn "Root disk doluluğu yüksek (%${st_pct})"
+    STATUS_STORAGE="WARN"; add_warn "Root disk usage high (${st_pct}%)"
   else
     STATUS_STORAGE="PASS"
   fi
   printf -v SUM_STORAGE 'Filesystem: %s\nRoot Disk: %s GB\nUsed: %s GB (%s%%)\nFree: %s GB' \
     "$st_fs" "$st_size" "$st_used" "$st_pct" "$st_avail"
 
-  # Diğer mount'larda %90+ doluluk
+  # 90%+ usage on other mounts
   while read -r use mnt; do
     use="${use%\%}"; [[ "$use" =~ ^[0-9]+$ ]] || continue
     [[ "$mnt" == "/" ]] && continue
-    (( use >= 90 )) && add_warn "Disk doluluğu yüksek: $mnt (%$use)"
+    (( use >= 90 )) && add_warn "Disk usage high: $mnt ($use%)"
   done < <(df -P 2>/dev/null | awk 'NR>1{print $5" "$6}')
 
   section "HARDWARE - SMART HEALTH"
@@ -224,7 +224,7 @@ print_hardware() {
   check_raid
 }
 
-# Bir SMART çıktısından öznitelik çıkarır (ATA / NVMe / SAS): "temp|poh|wear"
+# Extract attributes from a SMART output (ATA / NVMe / SAS): "temp|poh|wear"
 parse_smart_stats() {
   local a="$1" t p w life
   # Temperature: ATA(194) / NVMe / SAS
@@ -252,30 +252,30 @@ parse_smart_stats() {
 
 check_smart() {
   if ! command -v smartctl >/dev/null 2>&1; then
-    echo "smartctl bulunamadı (paket: smartmontools). SMART atlandı."
+    echo "smartctl not found (package: smartmontools). SMART skipped."
     STATUS_SMART="SKIP"; SUM_SMART="smartmontools not installed"; return
   fi
   if [[ "$IS_ROOT" -ne 1 ]]; then
-    echo "SMART için root gerekli, atlanıyor."
+    echo "Root required for SMART, skipping."
     STATUS_SMART="SKIP"; SUM_SMART="root required - skipped"; return
   fi
 
-  # Hedefleri topla: "dev|dtype" (dtype boş olabilir)
+  # Collect targets: "dev|dtype" (dtype may be empty)
   local targets=() bare=() mega=() base="" n out b t
   while read -r d; do bare+=("/dev/$d"); done \
     < <(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
 
-  # Donanımsal RAID arkasındaki fiziksel diskleri megaraid passthrough ile tara
+  # Scan physical disks behind a hardware RAID via megaraid passthrough
   if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi 'raid'; then
     base="${bare[0]:-}"
     if [[ -n "$base" ]]; then
-      echo "Donanımsal RAID tespit edildi; fiziksel diskler megaraid passthrough ile taranıyor..."
+      echo "Hardware RAID detected; scanning physical disks via megaraid passthrough..."
       for n in $(seq 0 31); do
         out="$(smartctl -i -d "megaraid,$n" "$base" 2>/dev/null)"
         echo "$out" | grep -qiE "Serial Number|Device Model|Product:|Vendor:" && mega+=("${base}|megaraid,$n")
       done
     fi
-    # megaraid diskleri bulunduysa sanal disk (base) sayımını atla
+    # If megaraid disks were found, exclude the virtual disk (base) from the count
     [[ "${#mega[@]}" -gt 0 ]] && bare=("${bare[@]:1}")
   fi
 
@@ -296,7 +296,7 @@ check_smart() {
     echo "$health"
     total=$((total+1))
     if echo "$health" | grep -qiE "FAILED|FAILING_NOW"; then
-      fail=$((fail+1)); failed_dev="$failed_dev ${dev}${dtype:+/$dtype}"; add_warn "SMART arızası: $dev ${dtype:+($dtype)}"
+      fail=$((fail+1)); failed_dev="$failed_dev ${dev}${dtype:+/$dtype}"; add_warn "SMART failure: $dev ${dtype:+($dtype)}"
     else
       ok=$((ok+1))
     fi
@@ -324,7 +324,7 @@ check_smart() {
 }
 
 check_raid() {
-  # 1) Önce Software RAID (mdadm) kontrol et
+  # 1) Check Software RAID (mdadm) first
   if [[ -e /proc/mdstat ]] && grep -qE '^md[0-9]' /proc/mdstat; then
     cat /proc/mdstat
     local detail degraded=0
@@ -338,7 +338,7 @@ check_raid() {
     echo "$detail" | grep -q '_' && degraded=1
     grep -qiE 'recovery|resync|rebuild' /proc/mdstat && degraded=1
     if (( degraded )); then
-      STATUS_RAID="WARN"; add_warn "Software RAID degraded / yeniden senkronize oluyor"
+      STATUS_RAID="WARN"; add_warn "Software RAID degraded / rebuilding"
       printf -v SUM_RAID 'Type: Software RAID (mdadm)\nStatus: DEGRADED / rebuilding\n%s' "$detail"
     else
       STATUS_RAID="PASS"
@@ -347,13 +347,13 @@ check_raid() {
     return
   fi
 
-  # 2) Software yoksa Hardware RAID denetleyicisini kontrol et
+  # 2) If no software RAID, check the hardware RAID controller
   local ctrl=""
   if command -v lspci >/dev/null 2>&1; then
     ctrl="$(lspci 2>/dev/null | grep -i 'raid' | sed -E 's/^[0-9a-fA-F:.]+ //; s/.*RAID bus controller: //I' | head -1)"
   fi
   if [[ -n "$ctrl" ]]; then
-    echo "Donanımsal RAID denetleyicisi tespit edildi: $ctrl"
+    echo "Hardware RAID controller detected: $ctrl"
     local raidtool="" vdout="" deg=0
     for t in storcli storcli64 perccli perccli64; do
       command -v "$t" >/dev/null 2>&1 && { raidtool="$t"; break; }
@@ -376,15 +376,15 @@ check_raid() {
         printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nVirtual drive(s): Optimal' "$ctrl"
       fi
     else
-      echo "(Vendor aracı bulunamadı: storcli / megacli / perccli - detaylı durum okunamadı)"
+      echo "(Vendor tool not found: storcli / megacli / perccli - detailed status unavailable)"
       STATUS_RAID="PASS"
       printf -v SUM_RAID 'Type: Hardware RAID\nController: %s' "$ctrl"
     fi
     return
   fi
 
-  # 3) Hiçbiri yok
-  echo "RAID bulunamadı (software veya hardware)."
+  # 3) None present
+  echo "No RAID detected (software or hardware)."
   STATUS_RAID="SKIP"
   SUM_RAID="No RAID detected (software or hardware)"
 }
@@ -394,10 +394,10 @@ check_raid() {
 # ---------------------------------------------------------------
 print_network() {
   section "NETWORK - INTERFACES"
-  echo "--- IPv4 Adresleri ---"
+  echo "--- IPv4 Addresses ---"
   ip -4 -br addr 2>/dev/null || ip addr
   echo
-  echo "--- IPv6 Adresleri ---"
+  echo "--- IPv6 Addresses ---"
   ip -6 -br addr 2>/dev/null
   echo
   echo "--- Routes ---"
@@ -421,7 +421,7 @@ print_network() {
   [[ -z "$Q_IPV4" ]] && Q_IPV4="n/a"
 
   echo
-  echo "--- DNS ---"; echo "${dns_list:-bulunamadı}"
+  echo "--- DNS ---"; echo "${dns_list:-not found}"
 
   section "NETWORK - CONNECTIVITY"
   local inet_ok=0 gw_ok=0 dns_ok=0
@@ -429,18 +429,18 @@ print_network() {
   echo "--- Ping 8.8.8.8 (IPv4) ---"
   if ping -4 -c 4 -W 2 8.8.8.8; then inet_ok=1; fi
   echo
-  echo "--- Gateway erişimi (${gw4:-yok}) ---"
+  echo "--- Gateway reachability (${gw4:-none}) ---"
   if [[ -n "$gw4" ]] && ping -c 2 -W 2 "$gw4" >/dev/null 2>&1; then
-    gw_ok=1; echo "Gateway $gw4 erişilebilir"
+    gw_ok=1; echo "Gateway $gw4 reachable"
   else
-    echo "Gateway erişilemiyor"
+    echo "Gateway unreachable"
   fi
   echo
-  echo "--- DNS çözümleme (google.com) ---"
+  echo "--- DNS resolution (google.com) ---"
   if timeout 5 getent ahosts google.com >/dev/null 2>&1; then
-    dns_ok=1; echo "DNS çözümleme başarılı"
+    dns_ok=1; echo "DNS resolution successful"
   else
-    echo "DNS çözümleme başarısız"
+    echo "DNS resolution failed"
   fi
   echo
   echo "--- Ping IPv6 (2606:4700:4700::1111) ---"
@@ -448,17 +448,17 @@ print_network() {
     STATUS_IPV6="PASS"; printf -v SUM_IPV6 'IPv6: %s' "${ipv6_cidr:-active}"
   else
     STATUS_IPV6="N/A"; SUM_IPV6="IPv6 not configured"
-    echo "IPv6 bağlantısı yok / yapılandırılmamış (uyarı değil)"
+    echo "No IPv6 connectivity / not configured (not a warning)"
   fi
 
-  # Durum + özet
+  # Status + summary
   if (( inet_ok )); then
     if (( dns_ok )); then STATUS_NET="PASS"; else
-      STATUS_NET="WARN"; add_warn "DNS çözümlemesi başarısız (google.com)"; fi
+      STATUS_NET="WARN"; add_warn "DNS resolution failed (google.com)"; fi
   else
-    STATUS_NET="FAIL"; add_warn "IPv4 internet erişimi yok (8.8.8.8 ulaşılamıyor)"
+    STATUS_NET="FAIL"; add_warn "No IPv4 internet access (8.8.8.8 unreachable)"
   fi
-  (( gw_ok == 0 )) && [[ -n "$gw4" ]] && add_warn "Gateway erişilemiyor ($gw4)"
+  (( gw_ok == 0 )) && [[ -n "$gw4" ]] && add_warn "Gateway unreachable ($gw4)"
 
   printf -v SUM_NET 'IPv4: %s\nGateway: %s %s %s\nDNS: %s %s %s\nInternet: %s %s' \
     "${ipv4_cidr:-n/a}" \
@@ -467,8 +467,8 @@ print_network() {
     "$(mark "$inet_ok")" "$([[ "$inet_ok" == "1" ]] && echo Connected || echo Disconnected)"
 
   section "NETWORK - PUBLIC IP"
-  echo "Public IPv4: $(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null || echo 'alınamadı')"
-  echo "Public IPv6: $(curl -6 -s --max-time 5 ifconfig.me 2>/dev/null || echo 'alınamadı')"
+  echo "Public IPv4: $(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null || echo 'unavailable')"
+  echo "Public IPv6: $(curl -6 -s --max-time 5 ifconfig.me 2>/dev/null || echo 'unavailable')"
 }
 
 # ---------------------------------------------------------------
@@ -481,7 +481,7 @@ print_services() {
     echo "SSH        : active"; STATUS_SSH="PASS"; SUM_SSH="Service active"
   else
     echo "SSH        : INACTIVE"; STATUS_SSH="WARN"; SUM_SSH="Service not active"
-    add_warn "SSH servisi aktif değil"
+    add_warn "SSH service not active"
   fi
 
   echo -n "Time sync  : "
@@ -493,11 +493,11 @@ print_services() {
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qi running; then
     echo "firewalld running"; STATUS_FW="PASS"; SUM_FW="firewalld running"
   elif command -v nft >/dev/null 2>&1 && [[ -n "$(nft list ruleset 2>/dev/null)" ]]; then
-    echo "nftables kuralları mevcut"; STATUS_FW="PASS"; SUM_FW="nftables rules present"
+    echo "nftables rules present"; STATUS_FW="PASS"; SUM_FW="nftables rules present"
   elif command -v iptables >/dev/null 2>&1 && [[ "$(iptables -S 2>/dev/null | wc -l)" -gt 3 ]]; then
-    echo "iptables kuralları mevcut"; STATUS_FW="PASS"; SUM_FW="iptables rules present"
+    echo "iptables rules present"; STATUS_FW="PASS"; SUM_FW="iptables rules present"
   else
-    echo "aktif firewall tespit edilmedi (dedicated teslimlerinde normal olabilir)"
+    echo "no active firewall detected (normal for dedicated deliveries)"
     STATUS_FW="INFO"; SUM_FW="No active firewall detected"
   fi
 }
@@ -506,7 +506,7 @@ print_services() {
 # ERROR CHECK
 # ---------------------------------------------------------------
 print_errors() {
-  section "ERROR CHECK - dmesg (donanım/IO hataları)"
+  section "ERROR CHECK - dmesg (hardware/IO errors)"
   local derr dcount
   derr="$(dmesg -T 2>/dev/null | grep -iE 'i/o error|blk_update_request|buffer i/o|nvme.*fail|ata.*error|smart.*fail|md.*degraded|critical|hardware error')"
   dcount="$(printf '%s' "$derr" | grep -c .)"
@@ -514,30 +514,30 @@ print_errors() {
     printf '%s\n' "$derr" | tail -30
     STATUS_DMESG="WARN"
     printf -v SUM_DMESG '%s critical I/O / hardware line(s) (see full log)' "$dcount"
-    add_warn "dmesg: $dcount kritik IO/donanım kaydı"
+    add_warn "dmesg: $dcount critical IO/hardware entries"
   else
-    echo "Dikkat çekici dmesg kaydı yok."
+    echo "No notable dmesg entries."
     STATUS_DMESG="PASS"; SUM_DMESG="No critical storage or hardware errors detected"
   fi
 }
 
 # ---------------------------------------------------------------
-# PERFORMANCE (her çalıştırmada: fio + speedtest + cpu)
+# PERFORMANCE (every run: fio + speedtest + cpu)
 # ---------------------------------------------------------------
-# Mbps değerini Mbps/Gbps olarak biçimlendir
+# Format an Mbps value as Mbps/Gbps
 fmt_speed() { awk -v v="$1" 'BEGIN{ if(v>=1000) printf "%.2f Gbps", v/1000; else printf "%.2f Mbps", v }'; }
 
-# Cloudflare tabanlı speed testi (sadece curl gerekir, güvenilir, lokasyon verir)
-# Çıktı: "DL_Mbps UL_Mbps PING_ms Lokasyon" veya başarısızsa boş + return 1
+# Cloudflare-based speed test (needs only curl, reliable, provides location)
+# Output: "DL_Mbps UL_Mbps PING_ms Location" or empty + return 1 on failure
 cf_speedtest() {
   command -v curl >/dev/null 2>&1 || return 1
   local meta down up lat city colo
-  local DL_BYTES=500000000 UL_BYTES=100000000   # ~500MB indir, ~100MB yükle
+  local DL_BYTES=500000000 UL_BYTES=100000000   # ~500MB download, ~100MB upload
   meta="$(curl -s --max-time 10 https://speed.cloudflare.com/meta 2>/dev/null)"
   down="$(curl -s -o /dev/null --max-time 20 -w '%{speed_download}' \
           "https://speed.cloudflare.com/__down?bytes=${DL_BYTES}" 2>/dev/null)"
   [[ "$down" =~ ^[0-9.]+$ ]] || return 1
-  awk -v d="$down" 'BEGIN{exit !(d>100000)}' || return 1   # > ~0.8 Mbps değilse başarısız say
+  awk -v d="$down" 'BEGIN{exit !(d>100000)}' || return 1   # treat as failure if not > ~0.8 Mbps
   lat="$(curl -s -o /dev/null --max-time 10 -w '%{time_connect}' \
          'https://speed.cloudflare.com/__down?bytes=0' 2>/dev/null)"
   up="$(head -c "$UL_BYTES" /dev/zero 2>/dev/null | curl -s -o /dev/null --max-time 20 \
@@ -552,7 +552,7 @@ cf_speedtest() {
 run_speedtest() {
   local tool="" smode="" dl="" ul="" ping="" srv="" out="" line="" serr="" SPEED_ERR=""
 
-  # 1) Ookla / speedtest-cli önce (kullanıcının aracı; gerçek sunucu lokasyonu)
+  # 1) Ookla / speedtest-cli first (the user-installed tool; real server location)
   if command -v speedtest >/dev/null 2>&1 && speedtest --version 2>&1 | grep -qi 'ookla'; then
     tool="speedtest"; smode="ookla"
   elif command -v speedtest-cli >/dev/null 2>&1; then
@@ -560,7 +560,7 @@ run_speedtest() {
   elif command -v speedtest >/dev/null 2>&1; then
     tool="speedtest"; smode="python"
   fi
-  [[ -n "$tool" ]] && echo "Yöntem: $tool ($smode)"
+  [[ -n "$tool" ]] && echo "Method: $tool ($smode)"
 
   if [[ -z "$dl" && "$smode" == "ookla" ]]; then
     out="$("$tool" -f json --accept-license --accept-gdpr 2>/dev/null)"
@@ -601,15 +601,15 @@ PY
     fi
   fi
 
-  # 3) Hâlâ sonuç yoksa Cloudflare (curl) - garanti yöntem (kurulum gerektirmez)
+  # 3) Still no result -> Cloudflare (curl) - guaranteed method (no install needed)
   if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-    echo "Yedek yöntem: Cloudflare (curl)"
+    echo "Fallback method: Cloudflare (curl)"
     line="$(cf_speedtest)"
     [[ -n "$line" ]] && read -r dl ul ping srv <<< "$line"
   fi
 
   if [[ -z "$dl" || "$dl" == "ERR" ]]; then
-    echo "Speed test çalıştırılamadı.${SPEED_ERR:+ Hata: $SPEED_ERR}"
+    echo "Speed test could not run.${SPEED_ERR:+ Error: $SPEED_ERR}"
     STATUS_SPEED="WARN"; SUM_SPEED="${SPEED_ERR:-speedtest unavailable}"; return
   fi
 
@@ -632,10 +632,10 @@ print_perf() {
   if command -v fio >/dev/null 2>&1; then
     fio --name=quickwrite --filename=/tmp/.fio_test --size=1G --bs=1M \
         --rw=write --direct=1 --runtime=30 --time_based --group_reporting 2>/dev/null \
-        | grep -E 'WRITE:|bw=|iops=' || echo "fio çalıştı (özet alınamadı)"
+        | grep -E 'WRITE:|bw=|iops=' || echo "fio ran (summary unavailable)"
     rm -f /tmp/.fio_test
   else
-    echo "fio kurulu değil (apt/yum install fio). Atlanıyor."
+    echo "fio not installed (apt/yum install fio). Skipping."
   fi
 
   section "PERFORMANCE - INTERNET SPEED (speedtest)"
@@ -645,9 +645,9 @@ print_perf() {
   if command -v geekbench6 >/dev/null 2>&1; then geekbench6
   elif command -v geekbench5 >/dev/null 2>&1; then geekbench5
   elif command -v openssl >/dev/null 2>&1; then
-    echo "(Geekbench yok - openssl ile hızlı CPU testi)"
+    echo "(No Geekbench - quick CPU test via openssl)"
     openssl speed -seconds 5 sha256 2>/dev/null | tail -5
-  else echo "CPU test aracı bulunamadı."; fi
+  else echo "No CPU test tool found."; fi
 }
 
 # ---------------------------------------------------------------
@@ -655,7 +655,7 @@ print_perf() {
 # ---------------------------------------------------------------
 compute_score() {
   local score=100 s
-  # Puanlanan bileşenler (IPv6/Firewall/Speed Test hariç)
+  # Scored components (excluding IPv6/Firewall/Speed Test)
   for s in "$STATUS_OS" "$STATUS_NTP" "$STATUS_CPU" "$STATUS_MEM" \
            "$STATUS_STORAGE" "$STATUS_NET" "$STATUS_SMART" "$STATUS_RAID" \
            "$STATUS_SSH" "$STATUS_DMESG"; do
@@ -693,10 +693,10 @@ sum_line() {
   fi
 }
 
-# --- JSON çıktısı ---
+# --- JSON output ---
 json_escape() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 
-# Çok satırlı detayı JSON dizisine çevirir; satır içi ✅/❌ işaretlerini temizler
+# Convert multi-line detail into a JSON array; strips inline marks
 json_details() {
   local detail="$1" line out="[" first=1
   while IFS= read -r line; do
@@ -813,18 +813,18 @@ print_summary() {
   echo
   printf "%-12s : %s\n" "Result" "$result"
   echo
-  echo "Log kaydı: $LOGFILE"
+  echo "Log file: $LOGFILE"
 }
 
 # ---------------------------------------------------------------
-# MAIN — tüm çıktıyı hem ekrana hem dosyaya yaz (tee)
-# (pipe nedeniyle aşağıdaki blok tek bir subshell'de çalışır;
-#  özet değişkenleri böylece tutarlı kalır.)
+# MAIN - write all output to both screen and file (tee)
+# (because of the pipe, the block below runs in a single subshell;
+#  so the summary variables stay consistent.)
 # ---------------------------------------------------------------
 run_all() {
   echo "===== SERVER HEALTHCHECK ====="
   date
-  [[ "$IS_ROOT" -ne 1 ]] && echo "UYARI: root değilsiniz; SMART/dmesg gibi bazı kontroller atlanabilir."
+  [[ "$IS_ROOT" -ne 1 ]] && echo "WARNING: not running as root; some checks (SMART/dmesg) may be skipped."
 
   install_prereqs
   print_health
@@ -841,7 +841,7 @@ run_all() {
 }
 
 if (( JSON_MODE )); then
-  # İnsan-okur log dosyaya, JSON ekrana
+  # Human-readable log to file, JSON to stdout
   run_all > "$LOGFILE" 2>&1
   cat "$JSONFILE"
 else
