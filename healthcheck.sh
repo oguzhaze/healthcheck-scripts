@@ -23,7 +23,7 @@
 set -uo pipefail 2>/dev/null || true
 
 # ---------------------------------------------------------------
-# Genel ayarlar
+# General Settings
 # ---------------------------------------------------------------
 # All tests (disk/speedtest/cpu) run on every invocation.
 
