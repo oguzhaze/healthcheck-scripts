@@ -46,9 +46,6 @@ chmod +x /usr/local/bin/healthcheck.sh
 ## Example Output
 
 ```text
-## Example Output
-
-```text
 =========================
    HEALTHCHECK SUMMARY
 =========================
@@ -132,8 +129,6 @@ Log file: /var/log/healthcheck_20260611_131814.log
 ===== HEALTHCHECK COMPLETED =====
 ```
 
-```
-
 ## Requirements
 
 * Linux operating system
@@ -142,4 +137,4 @@ Log file: /var/log/healthcheck_20260611_131814.log
 
 ## License
 
-Internal use for server deployment and health monitoring.
+MIT License
