@@ -23,7 +23,7 @@
 set -uo pipefail 2>/dev/null || true
 
 # ---------------------------------------------------------------
-# Genel ayarlar
+# General Settings
 # ---------------------------------------------------------------
 # All tests (disk/speedtest/cpu) run on every invocation.
 
@@ -589,20 +589,26 @@ run_network_perf() {
     [[ -n "$up" ]]   && echo "Upload   : $up"
     [[ -n "$down" ]] && echo "Download : $down"
     [[ -n "$lat" ]]  && echo "Latency  : $lat"
+
+    local line
     if [[ -n "$up" || -n "$down" ]]; then
       any=1
-      sumlines="${sumlines}${sumlines:+$'\n'}$(printf '%-11s D %s   U %s%s' \
-        "$label" "${down:-n/a}" "${up:-n/a}" "${lat:+   $lat}")"
+      line="$(printf '%-11s D %s   U %s%s' "$label" "${down:-n/a}" "${up:-n/a}" "${lat:+   $lat}")"
+    elif [[ -n "$lat" ]]; then
+      echo "(iperf3 failed - server busy/unreachable; host responds to ping)"
+      line="$(printf '%-11s D n/a   U n/a   %s' "$label" "$lat")"
     else
-      echo "(no result - server unreachable or busy)"
+      echo "(no result - server unreachable)"
+      line="$(printf '%-11s unreachable' "$label")"
     fi
+    sumlines="${sumlines}${sumlines:+$'\n'}${line}"
     sleep 1
   done <<< "$NETPERF_TARGETS"
 
   if (( any )); then
     STATUS_SPEED="PASS"; SUM_SPEED="$sumlines"
   else
-    STATUS_SPEED="WARN"; SUM_SPEED="all iperf3 servers unreachable"
+    STATUS_SPEED="WARN"; SUM_SPEED="${sumlines:-all iperf3 servers unreachable}"
   fi
 }
 
