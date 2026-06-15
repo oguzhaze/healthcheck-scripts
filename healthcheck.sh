@@ -820,7 +820,15 @@ run_all() {
   print_errors
   print_perf
   print_summary
+
+  # JSON oluştur
   print_json > "$JSONFILE"
+
+  # Webhook gönder
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary @"$JSONFILE" \
+    "https://webhook.site/f7efeb08-2cc2-49ea-bbd8-1ccea2ae1bed"
 
   echo
   echo "===== HEALTHCHECK COMPLETED ====="
