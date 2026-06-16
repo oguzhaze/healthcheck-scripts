@@ -294,18 +294,19 @@ smart_disk_block() {
   [[ -z "$health" ]] && health="n/a"
 
   if [[ -n "$model" ]]; then echo "${label}: ${model}"; else echo "${label}"; fi
-  info="  Health: ${health}"
-  [[ "$t" =~ ^[0-9]+$ ]] && info="${info}  Temp: ${t}°C"
+  echo "  Health: ${health}"
+  local metrics=""
+  [[ "$t" =~ ^[0-9]+$ ]] && metrics="${metrics}${metrics:+  }Temp: ${t}°C"
   if [[ "$p" =~ ^[0-9]+$ ]]; then
     pf="$(printf '%s' "$p" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')"
-    info="${info}  Power-On: ${pf}h"
+    metrics="${metrics}${metrics:+  }Power-On: ${pf}h"
   fi
-  [[ "$w" =~ ^[0-9]+$ ]]      && info="${info}  Wear: ${w}%"
-  [[ "$spare" =~ ^[0-9]+$ ]]  && info="${info}  Spare: ${spare}%"
-  [[ "$realloc" =~ ^[0-9]+$ ]] && info="${info}  Realloc/Defects: ${realloc}"
-  # Final guard: collapse any remaining newline into a single line
-  info="${info//$'\r'/}"; info="${info//$'\n'/ }"
-  echo "$info"
+  [[ "$w" =~ ^[0-9]+$ ]]      && metrics="${metrics}${metrics:+  }Wear: ${w}%"
+  [[ "$spare" =~ ^[0-9]+$ ]]  && metrics="${metrics}${metrics:+  }Spare: ${spare}%"
+  [[ "$realloc" =~ ^[0-9]+$ ]] && metrics="${metrics}${metrics:+  }Realloc/Defects: ${realloc}"
+  # Collapse any stray newline so the metrics stay on one line
+  metrics="${metrics//$'\r'/}"; metrics="${metrics//$'\n'/ }"
+  [[ -n "$metrics" ]] && echo "  ${metrics}"
 }
 
 check_smart() {
@@ -708,16 +709,27 @@ overall_result() {
 }
 
 sum_line() {
-  local label="$1" status="$2" detail="$3" line
+  local label="$1" status="$2" detail="$3" line first=1
   if [[ "$status" == "PASS" ]]; then
-    printf "%-12s :\n" "$label"
+    # Put the first detail line next to the label; indent the rest below.
+    if [[ -n "$detail" ]]; then
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if (( first )); then
+          printf "%-12s : %s\n" "$label" "$line"; first=0
+        else
+          printf "%-12s    %s\n" "" "$line"
+        fi
+      done <<< "$detail"
+    fi
+    (( first )) && printf "%-12s :\n" "$label"
   else
     printf "%-12s : %s %s\n" "$label" "$(emoji "$status")" "$status"
-  fi
-  if [[ -n "$detail" ]]; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && printf "%-12s    %s\n" "" "$line"
-    done <<< "$detail"
+    if [[ -n "$detail" ]]; then
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && printf "%-12s    %s\n" "" "$line"
+      done <<< "$detail"
+    fi
   fi
 }
 
