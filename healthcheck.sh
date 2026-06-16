@@ -23,7 +23,7 @@
 set -uo pipefail 2>/dev/null || true
 
 # ---------------------------------------------------------------
-# General Settings
+# Genel ayarlar
 # ---------------------------------------------------------------
 # All tests (disk/speedtest/cpu) run on every invocation.
 
@@ -261,6 +261,32 @@ parse_smart_stats() {
   echo "${t}|${p}|${w}"
 }
 
+# Build a per-disk SMART detail block: "<label>: <model>" + one info line.
+smart_disk_block() {
+  local a="$1" label="$2"
+  local model health t p w r realloc spare stats info pf
+  model="$(echo "$a" | sed -nE 's/^(Device Model|Model Number|Product):[[:space:]]+(.+)/\2/p' | head -1 | sed 's/[[:space:]]*$//')"
+  [[ -z "$model" ]] && model="$(echo "$a" | sed -nE 's/^Vendor:[[:space:]]+(.+)/\1/p' | head -1 | sed 's/[[:space:]]*$//')"
+  health="$(echo "$a" | grep -iE 'overall-health|SMART Health Status' | grep -oiE 'PASSED|FAILED|OK' | head -1)"
+  [[ -z "$health" ]] && health="n/a"
+  stats="$(parse_smart_stats "$a")"; t="${stats%%|*}"; r="${stats#*|}"; p="${r%%|*}"; w="${r##*|}"
+  realloc="$(echo "$a" | awk '$2=="Reallocated_Sector_Ct"{print $10; exit}')"
+  [[ -z "$realloc" ]] && realloc="$(echo "$a" | sed -nE 's/.*Elements in grown defect list:[[:space:]]+([0-9]+).*/\1/p' | head -1)"
+  spare="$(echo "$a" | sed -nE 's/^Available Spare:[[:space:]]+([0-9]+)%?.*/\1/p' | head -1)"
+
+  if [[ -n "$model" ]]; then echo "${label}: ${model}"; else echo "${label}"; fi
+  info="  Health: ${health}"
+  [[ "$t" =~ ^[0-9]+$ ]] && info="${info}  Temp: ${t}°C"
+  if [[ "$p" =~ ^[0-9]+$ ]]; then
+    pf="$(printf '%s' "$p" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')"
+    info="${info}  Power-On: ${pf}h"
+  fi
+  [[ "$w" =~ ^[0-9]+$ ]]      && info="${info}  Wear: ${w}%"
+  [[ "$spare" =~ ^[0-9]+$ ]]  && info="${info}  Spare: ${spare}%"
+  [[ "$realloc" =~ ^[0-9]+$ ]] && info="${info}  Realloc/Defects: ${realloc}"
+  echo "$info"
+}
+
 check_smart() {
   if ! command -v smartctl >/dev/null 2>&1; then
     echo "smartctl not found (package: smartmontools). SMART skipped."
@@ -293,8 +319,8 @@ check_smart() {
   for b in "${bare[@]}"; do targets+=("${b}|"); done
   [[ "${#mega[@]}" -gt 0 ]] && targets+=("${mega[@]}")
 
-  local total=0 ok=0 fail=0 failed_dev="" first=1
-  local dev dtype a health stats rest s_temp="" s_poh="" s_wear=""
+  local total=0 ok=0 fail=0 failed_dev="" idx=0 diskblocks=""
+  local dev dtype a health block dlabel
   for t in "${targets[@]}"; do
     dev="${t%%|*}"; dtype="${t##*|}"
     local dopt=(); [[ -n "$dtype" ]] && dopt=(-d "$dtype")
@@ -303,35 +329,29 @@ check_smart() {
     echo "$a" | grep -qiE "Unable to detect|No such device" && continue
     health="$(echo "$a" | grep -iE 'overall-health|SMART Health Status|test result' | head -1)"
     [[ -z "$health" ]] && continue
-    echo "--- $dev ${dtype:+($dtype)} ---"
-    echo "$health"
-    total=$((total+1))
+    idx=$((idx+1)); total=$((total+1))
     if echo "$health" | grep -qiE "FAILED|FAILING_NOW"; then
       fail=$((fail+1)); failed_dev="$failed_dev ${dev}${dtype:+/$dtype}"; add_warn "SMART failure: $dev ${dtype:+($dtype)}"
     else
       ok=$((ok+1))
     fi
-    if [[ "$first" -eq 1 ]]; then
-      stats="$(parse_smart_stats "$a")"
-      s_temp="${stats%%|*}"; rest="${stats#*|}"
-      s_poh="${rest%%|*}"; s_wear="${rest##*|}"
-      first=0
-    fi
+    if [[ -n "$dtype" ]]; then dlabel="Disk ${idx} (${dtype})"; else dlabel="Disk ${idx} (${dev})"; fi
+    block="$(smart_disk_block "$a" "$dlabel")"
+    echo "--- $dev ${dtype:+($dtype)} ---"
+    echo "$block"
+    diskblocks="${diskblocks}${diskblocks:+$'\n'}${block}"
   done
 
-  local base_line extra=""
+  local base_line
   if   [[ "$fail" -gt 0 ]]; then STATUS_SMART="FAIL"; base_line="FAILED disk(s):${failed_dev}"
   elif [[ "$total" -gt 0 ]]; then STATUS_SMART="PASS"; base_line="${ok}/${total} disk(s) PASSED"
   else STATUS_SMART="SKIP"; base_line="No SMART-capable disks (virtual?)"; fi
 
-  [[ "$s_temp" =~ ^[0-9]+$ ]] && extra="${extra}"$'\n'"Temperature: ${s_temp}°C"
-  if [[ "$s_poh" =~ ^[0-9]+$ ]]; then
-    local poh_fmt; poh_fmt="$(printf '%s' "$s_poh" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta')"
-    extra="${extra}"$'\n'"Power On Hours: ${poh_fmt}"
+  if [[ -n "$diskblocks" ]]; then
+    SUM_SMART="${base_line}"$'\n'"${diskblocks}"
+  else
+    SUM_SMART="${base_line}"
   fi
-  [[ "$s_wear" =~ ^[0-9]+$ ]] && extra="${extra}"$'\n'"SSD Wear: ${s_wear}%"
-
-  SUM_SMART="${base_line}${extra}"
 }
 
 check_raid() {
@@ -496,7 +516,7 @@ print_services() {
   fi
 
   echo -n "Time sync  : "
-  systemctl is-active systemd-timesyncd chronyd chrony ntpd 2>/dev/null | paste -sd' ' || echo "bilinmiyor"
+  systemctl is-active systemd-timesyncd chronyd chrony ntpd 2>/dev/null | paste -sd' ' || echo "unknown"
 
   echo -n "Firewall   : "
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
@@ -536,13 +556,14 @@ print_errors() {
 # PERFORMANCE (every run: fio + network (iperf3) + cpu)
 # ---------------------------------------------------------------
 # iperf3 test locations as "Label|host" lines. Override with the NETPERF_TARGETS env var.
-# Public iperf3 servers you can use (add/remove as you like):
+# Default: the provider's own (servernet) endpoints -> same network, near line-rate.
+# Other public iperf3 servers you can use instead:
 #   London|lon.speedtest.clouvider.net      Amsterdam|iperf-ams-nl.eranium.net
 #   Tashkent|speedtest.uztelecom.uz         Singapore|speedtest.sin1.sg.leaseweb.net
 #   Los Angeles|la.speedtest.clouvider.net  New York|speedtest.nyc1.us.leaseweb.net
 #   Sao Paulo|speedtest.sao1.edgoo.net
-NETPERF_TARGETS="${NETPERF_TARGETS:-London|lon.speedtest.clouvider.net
-Amsterdam|iperf-ams-nl.eranium.net}"
+NETPERF_TARGETS="${NETPERF_TARGETS:-London|speedtest.lon1.servernet.net
+Amsterdam|speedtest.ams1.servernet.net}"
 
 # Bandwidth from the [SUM] receiver line of iperf3 (-P >1) output, e.g. "9.42 Gbits/sec"
 iperf_rate() { awk '/receiver$/{r=$(NF-2)" "$(NF-1); if($1=="[SUM]") s=r} END{print (s!=""?s:r)}'; }
@@ -614,7 +635,7 @@ run_network_perf() {
 }
 
 print_perf() {
-  section "PERFORMANCE - DISK (fio, 30sn)"
+  section "PERFORMANCE - DISK (fio, 30s)"
   if command -v fio >/dev/null 2>&1; then
     fio --name=quickwrite --filename=/tmp/.fio_test --size=1G --bs=1M \
         --rw=write --direct=1 --runtime=30 --time_based --group_reporting 2>/dev/null \
@@ -671,7 +692,11 @@ overall_result() {
 
 sum_line() {
   local label="$1" status="$2" detail="$3" line
-  printf "%-12s : %s %s\n" "$label" "$(emoji "$status")" "$status"
+  if [[ "$status" == "PASS" ]]; then
+    printf "%-12s : %s\n" "$label" "$(emoji "$status")"
+  else
+    printf "%-12s : %s %s\n" "$label" "$(emoji "$status")" "$status"
+  fi
   if [[ -n "$detail" ]]; then
     while IFS= read -r line; do
       [[ -n "$line" ]] && printf "%-12s    %s\n" "" "$line"
@@ -772,18 +797,20 @@ print_summary() {
   echo
   sum_line "Storage"  "$STATUS_STORAGE" "$SUM_STORAGE"
   echo
+  sum_line "SMART"    "$STATUS_SMART"   "$SUM_SMART"
+  echo
+  sum_line "RAID"     "$STATUS_RAID"    "$SUM_RAID"
+  echo
   sum_line "Network"  "$STATUS_NET"     "$SUM_NET"
   echo
   if [[ -n "$STATUS_SPEED" ]]; then
     sum_line "Network Perf" "$STATUS_SPEED" "$SUM_SPEED"
     echo
   fi
-  sum_line "IPv6"     "$STATUS_IPV6"    "$SUM_IPV6"
-  echo
-  sum_line "SMART"    "$STATUS_SMART"   "$SUM_SMART"
-  echo
-  sum_line "RAID"     "$STATUS_RAID"    "$SUM_RAID"
-  echo
+  if [[ "$STATUS_IPV6" == "PASS" ]]; then
+    sum_line "IPv6"     "$STATUS_IPV6"    "$SUM_IPV6"
+    echo
+  fi
   sum_line "SSH"      "$STATUS_SSH"     "$SUM_SSH"
   echo
   sum_line "Firewall" "$STATUS_FW"      "$SUM_FW"
@@ -820,15 +847,16 @@ run_all() {
   print_errors
   print_perf
   print_summary
-
-  # JSON oluştur
+  # Generate JSON summary
   print_json > "$JSONFILE"
 
-  # Webhook gönder
-  curl -s -X POST \
-    -H "Content-Type: application/json" \
-    --data-binary @"$JSONFILE" \
-    "https://webhook.site/f7efeb08-2cc2-49ea-bbd8-1ccea2ae1bed"
+  # Send JSON summary to a webhook (set WEBHOOK_URL='' to disable)
+  WEBHOOK_URL="${WEBHOOK_URL:-https://webhook.site/f7efeb08-2cc2-49ea-bbd8-1ccea2ae1bed}"
+  if [[ -n "$WEBHOOK_URL" ]]; then
+    curl -s -X POST -H "Content-Type: application/json" \
+      --data-binary @"$JSONFILE" "$WEBHOOK_URL" >/dev/null 2>&1 \
+      && echo "Webhook: sent" || echo "Webhook: failed"
+  fi
 
   echo
   echo "===== HEALTHCHECK COMPLETED ====="
