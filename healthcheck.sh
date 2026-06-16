@@ -82,6 +82,15 @@ mark() {
   fi
 }
 
+# Inline failure-only mark: empty when OK, ❌/X when not (so ✅ never appears in details).
+okx() {
+  if [[ "$1" == "1" ]]; then
+    printf ''
+  else
+    [[ "${NO_EMOJI:-0}" == "1" ]] && printf ' X' || printf ' ❌'
+  fi
+}
+
 # Install missing tools (smartmontools, iperf3, fio) and enable smartd. Requires root + internet.
 install_prereqs() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
@@ -274,6 +283,16 @@ smart_disk_block() {
   [[ -z "$realloc" ]] && realloc="$(echo "$a" | sed -nE 's/.*Elements in grown defect list:[[:space:]]+([0-9]+).*/\1/p' | head -1)"
   spare="$(echo "$a" | sed -nE 's/^Available Spare:[[:space:]]+([0-9]+)%?.*/\1/p' | head -1)"
 
+  # Strip stray CR/LF (and whitespace from numeric fields) so the line never wraps
+  model="$(printf '%s' "$model"   | tr -d '\r\n' | sed 's/[[:space:]]*$//')"
+  health="$(printf '%s' "$health" | tr -d '\r\n[:space:]')"
+  t="$(printf '%s' "$t"           | tr -cd '0-9')"
+  p="$(printf '%s' "$p"           | tr -cd '0-9')"
+  w="$(printf '%s' "$w"           | tr -cd '0-9')"
+  realloc="$(printf '%s' "$realloc" | tr -cd '0-9')"
+  spare="$(printf '%s' "$spare"   | tr -cd '0-9')"
+  [[ -z "$health" ]] && health="n/a"
+
   if [[ -n "$model" ]]; then echo "${label}: ${model}"; else echo "${label}"; fi
   info="  Health: ${health}"
   [[ "$t" =~ ^[0-9]+$ ]] && info="${info}  Temp: ${t}°C"
@@ -284,6 +303,8 @@ smart_disk_block() {
   [[ "$w" =~ ^[0-9]+$ ]]      && info="${info}  Wear: ${w}%"
   [[ "$spare" =~ ^[0-9]+$ ]]  && info="${info}  Spare: ${spare}%"
   [[ "$realloc" =~ ^[0-9]+$ ]] && info="${info}  Realloc/Defects: ${realloc}"
+  # Final guard: collapse any remaining newline into a single line
+  info="${info//$'\r'/}"; info="${info//$'\n'/ }"
   echo "$info"
 }
 
@@ -491,11 +512,11 @@ print_network() {
   fi
   (( gw_ok == 0 )) && [[ -n "$gw4" ]] && add_warn "Gateway unreachable ($gw4)"
 
-  printf -v SUM_NET 'IPv4: %s\nGateway: %s %s %s\nDNS: %s %s %s\nInternet: %s %s' \
+  printf -v SUM_NET 'IPv4: %s\nGateway: %s %s%s\nDNS: %s %s%s\nInternet: %s%s' \
     "${ipv4_cidr:-n/a}" \
-    "${gw4:-n/a}" "$(mark "$gw_ok")"   "$([[ "$gw_ok"   == "1" ]] && echo Reachable || echo Unreachable)" \
-    "${dns_list:-n/a}" "$(mark "$dns_ok")" "$([[ "$dns_ok" == "1" ]] && echo Working   || echo Failing)" \
-    "$(mark "$inet_ok")" "$([[ "$inet_ok" == "1" ]] && echo Connected || echo Disconnected)"
+    "${gw4:-n/a}" "$([[ "$gw_ok"   == "1" ]] && echo Reachable || echo Unreachable)" "$(okx "$gw_ok")" \
+    "${dns_list:-n/a}" "$([[ "$dns_ok" == "1" ]] && echo Working || echo Failing)" "$(okx "$dns_ok")" \
+    "$([[ "$inet_ok" == "1" ]] && echo Connected || echo Disconnected)" "$(okx "$inet_ok")"
 
   section "NETWORK - PUBLIC IP"
   echo "Public IPv4: $(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null || echo 'unavailable')"
@@ -528,8 +549,8 @@ print_services() {
   elif command -v iptables >/dev/null 2>&1 && [[ "$(iptables -S 2>/dev/null | wc -l)" -gt 3 ]]; then
     echo "iptables rules present"; STATUS_FW="PASS"; SUM_FW="iptables rules present"
   else
-    echo "no active firewall detected (normal for dedicated deliveries)"
-    STATUS_FW="INFO"; SUM_FW="No active firewall detected"
+    echo "No firewall active on the OS side (ufw/firewalld/nftables/iptables all inactive) - normal for dedicated deliveries"
+    STATUS_FW="INFO"; SUM_FW="No firewall active on the OS side (ufw/firewalld/nftables/iptables)"
   fi
 }
 
@@ -556,14 +577,10 @@ print_errors() {
 # PERFORMANCE (every run: fio + network (iperf3) + cpu)
 # ---------------------------------------------------------------
 # iperf3 test locations as "Label|host" lines. Override with the NETPERF_TARGETS env var.
-# Default: the provider's own (servernet) endpoints -> same network, near line-rate.
-# Other public iperf3 servers you can use instead:
-#   London|lon.speedtest.clouvider.net      Amsterdam|iperf-ams-nl.eranium.net
-#   Tashkent|speedtest.uztelecom.uz         Singapore|speedtest.sin1.sg.leaseweb.net
-#   Los Angeles|la.speedtest.clouvider.net  New York|speedtest.nyc1.us.leaseweb.net
-#   Sao Paulo|speedtest.sao1.edgoo.net
-NETPERF_TARGETS="${NETPERF_TARGETS:-London|speedtest.lon1.servernet.net
-Amsterdam|speedtest.ams1.servernet.net}"
+# Default: London, Amsterdam, New York.
+NETPERF_TARGETS="${NETPERF_TARGETS:-London|lon.speedtest.clouvider.net
+Amsterdam|iperf-ams-nl.eranium.net
+New York|speedtest.nyc1.us.leaseweb.net}"
 
 # Bandwidth from the [SUM] receiver line of iperf3 (-P >1) output, e.g. "9.42 Gbits/sec"
 iperf_rate() { awk '/receiver$/{r=$(NF-2)" "$(NF-1); if($1=="[SUM]") s=r} END{print (s!=""?s:r)}'; }
@@ -693,7 +710,7 @@ overall_result() {
 sum_line() {
   local label="$1" status="$2" detail="$3" line
   if [[ "$status" == "PASS" ]]; then
-    printf "%-12s : %s\n" "$label" "$(emoji "$status")"
+    printf "%-12s :\n" "$label"
   else
     printf "%-12s : %s %s\n" "$label" "$(emoji "$status")" "$status"
   fi
