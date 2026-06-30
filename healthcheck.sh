@@ -23,7 +23,7 @@
 set -uo pipefail 2>/dev/null || true
 
 # ---------------------------------------------------------------
-# Genel ayarlar
+# General settings
 # ---------------------------------------------------------------
 # All tests (disk/speedtest/cpu) run on every invocation.
 
@@ -53,6 +53,11 @@ STATUS_SPEED=""; SUM_SPEED=""
 
 # Top quick info
 Q_HOST=""; Q_OS=""; Q_CPU=""; Q_RAM=""; Q_STORAGE=""; Q_IPV4=""
+
+# Inventory extras
+RAID_KIND=""; RAID_LEVEL=""; RAID_CTRL=""
+OS_UPDATES=""
+NET_IPV4=""; NET_GW=""; NET_DNS=""
 
 WARNINGS=()
 add_warn() { WARNINGS+=("$1"); }
@@ -92,6 +97,50 @@ okx() {
 }
 
 # Install missing tools (smartmontools, iperf3, fio) and enable smartd. Requires root + internet.
+# Broadcom StorCLI .deb (MegaRAID/SAS RAID CLI). Override with STORCLI_DEB_URL.
+STORCLI_DEB_URL="${STORCLI_DEB_URL:-https://github.com/oguzhaze/healthcheck-scripts/raw/refs/heads/main/storcli_007.3703.0000.0000_all.deb}"
+
+# Download + install Broadcom StorCLI when a RAID controller is present but no CLI is found.
+# Installs storcli64 to /opt/MegaRAID/storcli/storcli64 (already on find_raid_tool's path list).
+install_storcli() {
+  [[ "${NO_INSTALL:-0}" == "1" ]] && return
+  [[ "$IS_ROOT" -eq 1 ]] || return
+  find_raid_tool >/dev/null 2>&1 && return        # already have storcli/perccli
+  local has_raid=0
+  command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi 'raid' && has_raid=1
+  [[ "$has_raid" -eq 1 ]] || return               # only bother on RAID hosts
+
+  if ! command -v dpkg >/dev/null 2>&1; then
+    echo "StorCLI auto-install needs a .deb/dpkg system; install storcli manually on this OS."
+    return
+  fi
+
+  local deb="/tmp/storcli_install.$$.deb"
+  echo "RAID CLI not found - downloading Broadcom StorCLI..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 60 -o "$deb" "$STORCLI_DEB_URL" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=60 -O "$deb" "$STORCLI_DEB_URL" 2>/dev/null
+  else
+    echo "Neither curl nor wget available; cannot fetch StorCLI."; return
+  fi
+
+  if [[ ! -s "$deb" ]]; then
+    echo "StorCLI download failed (check network/URL)."; rm -f "$deb"; return
+  fi
+  if dpkg -i "$deb" >/dev/null 2>&1; then
+    echo "StorCLI installed: $(find_raid_tool 2>/dev/null || echo /opt/MegaRAID/storcli/storcli64)"
+  else
+    apt-get -f install -y >/dev/null 2>&1
+    if dpkg -i "$deb" >/dev/null 2>&1; then
+      echo "StorCLI installed: $(find_raid_tool 2>/dev/null)"
+    else
+      echo "StorCLI install failed (dpkg)."
+    fi
+  fi
+  rm -f "$deb"
+}
+
 install_prereqs() {
   [[ "${NO_INSTALL:-0}" == "1" ]] && return
   if [[ "$IS_ROOT" -ne 1 ]]; then
@@ -130,11 +179,58 @@ install_prereqs() {
       echo "smartd service: enabled and running"
     fi
   fi
+
+  # Install Broadcom StorCLI so hardware RAID level/state can be read
+  install_storcli
 }
 
 # ---------------------------------------------------------------
 # HEALTH
 # ---------------------------------------------------------------
+# OS package update status: pending upgrades + age of last metadata refresh.
+# Uses cached package lists only (no network).
+os_update_status() {
+  local pend="" stamp="" now diff age="" mgr=""
+  if command -v apt-get >/dev/null 2>&1; then
+    mgr="apt"
+    if command -v apt >/dev/null 2>&1; then
+      pend="$(apt list --upgradable 2>/dev/null | grep -c '/')"
+    fi
+    [[ -z "$pend" || "$pend" == "0" ]] && pend="$(apt-get -s -o Debug::NoLocking=true upgrade 2>/dev/null | grep -c '^Inst')"
+    if [[ -f /var/lib/apt/periodic/update-success-stamp ]]; then
+      stamp="$(stat -c %Y /var/lib/apt/periodic/update-success-stamp 2>/dev/null)"
+    elif [[ -e /var/cache/apt/pkgcache.bin ]]; then
+      stamp="$(stat -c %Y /var/cache/apt/pkgcache.bin 2>/dev/null)"
+    elif [[ -d /var/lib/apt/lists ]]; then
+      stamp="$(stat -c %Y /var/lib/apt/lists 2>/dev/null)"
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    mgr="dnf"
+    pend="$(dnf -q -C check-update 2>/dev/null | awk 'NF>=3 && $1 !~ /^(Last|Obsoleting|Security|Loaded)/ {c++} END{print c+0}')"
+    [[ -e /var/cache/dnf ]] && stamp="$(stat -c %Y /var/cache/dnf 2>/dev/null)"
+  elif command -v yum >/dev/null 2>&1; then
+    mgr="yum"
+    pend="$(yum -q -C check-update 2>/dev/null | awk 'NF>=3 && $1 !~ /^(Last|Obsoleting|Loaded)/ {c++} END{print c+0}')"
+  else
+    OS_UPDATES="unknown (no apt/dnf/yum)"; return
+  fi
+  pend="${pend//[^0-9]/}"; [[ -z "$pend" ]] && pend="0"
+
+  if [[ -n "$stamp" && "$stamp" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"; diff=$(( now - stamp ))
+    if   (( diff < 3600 ));  then age="$(( diff/60 ))m ago"
+    elif (( diff < 86400 )); then age="$(( diff/3600 ))h ago"
+    else                          age="$(( diff/86400 ))d ago"; fi
+  fi
+
+  if [[ "$pend" == "0" ]]; then
+    OS_UPDATES="up to date (0 pending)"
+  else
+    OS_UPDATES="${pend} update(s) available"
+  fi
+  [[ -n "$age" ]] && OS_UPDATES="${OS_UPDATES}; package lists refreshed ${age}"
+}
+
 print_health() {
   section "HEALTH"
 
@@ -159,6 +255,13 @@ print_health() {
   echo "Kernel     : $kernel"
   echo "Arch       : $(uname -m)"
   echo "Uptime     : $(uptime -p 2>/dev/null || uptime)"
+
+  # Package update status (pending upgrades + last metadata refresh)
+  os_update_status
+  if [[ -n "$OS_UPDATES" ]]; then
+    echo "Updates    : $OS_UPDATES"
+    SUM_OS="${SUM_OS}"$'\n'"Updates: ${OS_UPDATES}"
+  fi
 
   local tz sync
   tz="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)"
@@ -376,11 +479,77 @@ check_smart() {
   fi
 }
 
+# Locate a MegaRAID/PERC CLI tool. Newer tri-mode cards (SAS38xx / 9560) use storcli2,
+# and the binary is usually installed OUTSIDE PATH (e.g. /opt/MegaRAID/storcli2/storcli2).
+# We probe PATH, then known absolute locations, then a bounded filesystem search.
+find_raid_tool() {
+  local t p hit
+  for t in storcli2 storcli storcli64 perccli2 perccli perccli64; do
+    command -v "$t" >/dev/null 2>&1 && { printf '%s' "$t"; return 0; }
+  done
+  for p in \
+    /opt/MegaRAID/storcli2/storcli2 \
+    /opt/MegaRAID/storcli/storcli64 /opt/MegaRAID/storcli/storcli \
+    /opt/MegaRAID/perccli2/perccli2 \
+    /opt/MegaRAID/perccli/perccli64 /opt/MegaRAID/perccli/perccli \
+    /opt/lsi/storcli/storcli64 /opt/lsi/storcli/storcli \
+    /usr/local/sbin/storcli2 /usr/local/sbin/storcli64 \
+    /usr/local/bin/storcli2  /usr/local/bin/storcli64 \
+    /usr/sbin/storcli2 /usr/sbin/storcli64 \
+    /usr/bin/storcli2  /usr/bin/storcli64 \
+    /opt/storcli/storcli64 /root/storcli2 /root/storcli64; do
+    [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  # Bounded search of common trees (fast: shallow, limited dirs)
+  hit="$(find /opt /usr/local /root /usr/sbin -maxdepth 4 -type f \
+            \( -name 'storcli2' -o -name 'storcli64' -o -name 'storcli' \
+               -o -name 'perccli2' -o -name 'perccli64' -o -name 'perccli' \) \
+            -perm -u+x 2>/dev/null | head -1)"
+  [[ -n "$hit" ]] && { printf '%s' "$hit"; return 0; }
+  return 1
+}
+
+# Infer RAID level from physical disk count vs usable VD capacity (no vendor tool needed).
+# Uses the megaraid smartctl passthrough (already works on this host) + lsblk VD size.
+infer_raid_level() {
+  command -v smartctl >/dev/null 2>&1 || return 1
+  [[ "$IS_ROOT" -eq 1 ]] || return 1
+  local base n out cnt=0 per_gb="" usable_b usable_gb b
+  base="$(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1; exit}')"
+  [[ -n "$base" ]] || return 1
+  for n in $(seq 0 31); do
+    out="$(smartctl -i -d "megaraid,$n" "/dev/$base" 2>/dev/null)"
+    echo "$out" | grep -qiE "Device Model|Model Number|Product:" || continue
+    echo "$out" | grep -qiE 'SES|Enclosure|Expander|Virtual.*SES' && continue
+    cnt=$((cnt+1))
+    if [[ -z "$per_gb" ]]; then
+      b="$(echo "$out" | sed -nE 's/.*User Capacity:[[:space:]]*([0-9,]+) bytes.*/\1/p' | head -1 | tr -d ,)"
+      [[ -z "$b" ]] && b="$(echo "$out" | sed -nE 's/.*Total NVM Capacity:[[:space:]]*([0-9,]+) bytes.*/\1/p' | head -1 | tr -d ,)"
+      [[ -n "$b" ]] && per_gb=$(( b / 1000000000 ))
+    fi
+  done
+  [[ "$cnt" -ge 1 && -n "$per_gb" && "$per_gb" -gt 0 ]] || return 1
+  usable_b="$(lsblk -bdno SIZE "/dev/$base" 2>/dev/null | head -1)"
+  [[ "$usable_b" =~ ^[0-9]+$ ]] || return 1
+  usable_gb=$(( usable_b / 1000000000 ))
+  awk -v n="$cnt" -v per="$per_gb" -v use="$usable_gb" '
+    function near(a,b,  t){t=0.15; return (a>=b*(1-t) && a<=b*(1+t))}
+    BEGIN{
+      if(per<=0) exit 1; r=use/per;
+      if(near(r,1)   && n>=2)                {print "RAID 1"; exit}
+      if(near(r,n))                          {print "RAID 0"; exit}
+      if(n>=3 && near(r,n-1))                {print "RAID 5"; exit}
+      if(n>=4 && (n%2)==0 && near(r,n/2))    {print "RAID 10"; exit}
+      if(n>=4 && near(r,n-2))                {print "RAID 6"; exit}
+      exit 1
+    }'
+}
+
 check_raid() {
   # 1) Check Software RAID (mdadm) first
   if [[ -e /proc/mdstat ]] && grep -qE '^md[0-9]' /proc/mdstat; then
     cat /proc/mdstat
-    local detail degraded=0
+    local detail degraded=0 md_lvl
     detail="$(awk '
       /^md[0-9]/ { dev=$1; lvl=$4 }
       /\[[U_]+\]/ {
@@ -390,12 +559,22 @@ check_raid() {
     [[ -z "$detail" ]] && detail="$(grep -E '^md[0-9]' /proc/mdstat | awk '{print $1": "$4}')"
     echo "$detail" | grep -q '_' && degraded=1
     grep -qiE 'recovery|resync|rebuild' /proc/mdstat && degraded=1
+
+    RAID_KIND="Software RAID (mdadm)"; RAID_CTRL="Linux md (kernel)"
+    md_lvl="$(printf '%s\n' "$detail" | awk 'NR==1{print $2}')"
+    case "$md_lvl" in
+      raid0)  RAID_LEVEL="RAID 0";;  raid1)  RAID_LEVEL="RAID 1";;
+      raid5)  RAID_LEVEL="RAID 5";;  raid6)  RAID_LEVEL="RAID 6";;
+      raid10) RAID_LEVEL="RAID 10";; linear) RAID_LEVEL="Linear / JBOD";;
+      "")     RAID_LEVEL="unknown";; *)      RAID_LEVEL="${md_lvl}";;
+    esac
+
     if (( degraded )); then
       STATUS_RAID="WARN"; add_warn "Software RAID degraded / rebuilding"
-      printf -v SUM_RAID 'Type: Software RAID (mdadm)\nStatus: DEGRADED / rebuilding\n%s' "$detail"
+      printf -v SUM_RAID 'Type: Software RAID (mdadm)\nLevel: %s\nStatus: DEGRADED / rebuilding\n%s' "$RAID_LEVEL" "$detail"
     else
       STATUS_RAID="PASS"
-      printf -v SUM_RAID 'Type: Software RAID (mdadm)\nStatus: healthy\n%s' "$detail"
+      printf -v SUM_RAID 'Type: Software RAID (mdadm)\nLevel: %s\nStatus: healthy\n%s' "$RAID_LEVEL" "$detail"
     fi
     return
   fi
@@ -407,38 +586,87 @@ check_raid() {
   fi
   if [[ -n "$ctrl" ]]; then
     echo "Hardware RAID controller detected: $ctrl"
-    local raidtool="" vdout="" deg=0
-    for t in storcli storcli64 perccli perccli64; do
-      command -v "$t" >/dev/null 2>&1 && { raidtool="$t"; break; }
-    done
+    RAID_KIND="Hardware RAID"; RAID_CTRL="$ctrl"
+    local raidtool="" vdout="" deg=0 lvl="" spec inferred
+    local -a try
+    raidtool="$(find_raid_tool)"
     if [[ -n "$raidtool" ]]; then
-      vdout="$("$raidtool" /call/vall show nolog 2>/dev/null)"
+      echo "Using RAID CLI: $raidtool"
+      # storcli vs storcli2 accept slightly different scopes - try a few
+      for spec in "/call/vall show nolog" "/c0/vall show nolog" "/call/vall show" "/c0/vall show"; do
+        read -r -a try <<< "$spec"
+        vdout="$("$raidtool" "${try[@]}" 2>/dev/null)"
+        printf '%s\n' "$vdout" | grep -qiE '^[0-9]+/[0-9]+|RAID[0-9]' && break
+        vdout=""
+      done
     elif command -v megacli >/dev/null 2>&1 || command -v MegaCli64 >/dev/null 2>&1; then
       raidtool="$(command -v megacli || command -v MegaCli64)"
       vdout="$("$raidtool" -LDInfo -Lall -aAll -NoLog 2>/dev/null)"
     fi
 
+    # RAID level from the VD table (storcli: "0/0 RAID0 Optl ..."; megacli: "Primary-1, Secondary-0")
+    if [[ -n "$vdout" ]]; then
+      lvl="$(printf '%s\n' "$vdout" | awk '$1 ~ /^[0-9]+\/[0-9]+$/ {print $2; exit}')"
+      [[ -z "$lvl" ]] && lvl="$(printf '%s\n' "$vdout" | sed -nE 's/.*Primary-([0-9]+), Secondary-([0-9]+).*/RAID\1\2/p' | head -1)"
+    fi
+    # No VD? Check for JBOD / pass-through drives
+    if [[ -z "$lvl" && "$raidtool" =~ storcli|perccli ]]; then
+      for spec in "/call/eall/sall show nolog" "/c0/eall/sall show nolog"; do
+        read -r -a try <<< "$spec"
+        printf '%s\n' "$("$raidtool" "${try[@]}" 2>/dev/null)" | grep -qiE '\bJBOD\b' && { lvl="JBOD"; break; }
+      done
+    fi
+    case "$lvl" in
+      RAID0)  RAID_LEVEL="RAID 0";;  RAID1)  RAID_LEVEL="RAID 1";;
+      RAID5)  RAID_LEVEL="RAID 5";;  RAID6)  RAID_LEVEL="RAID 6";;
+      RAID10) RAID_LEVEL="RAID 10";; RAID00) RAID_LEVEL="RAID 00";;
+      RAID50) RAID_LEVEL="RAID 50";; RAID60) RAID_LEVEL="RAID 60";;
+      JBOD)   RAID_LEVEL="JBOD";;
+      "")     RAID_LEVEL="";;
+      *)      RAID_LEVEL="$lvl";;
+    esac
+    # Fallback: no vendor tool / no level -> infer from disk count vs usable capacity
+    if [[ -z "$RAID_LEVEL" ]]; then
+      inferred="$(infer_raid_level)"
+      if [[ -n "$inferred" ]]; then
+        RAID_LEVEL="${inferred} (inferred from capacity)"
+      elif [[ -z "$raidtool" ]]; then
+        RAID_LEVEL="unknown (storcli not found; install storcli2 for SAS38xx cards)"
+      else
+        RAID_LEVEL="unknown (vendor tool returned no virtual drive)"
+      fi
+    fi
+
     if [[ -n "$vdout" ]]; then
       echo "$vdout"
-      echo "$vdout" | grep -qiE 'Dgrd|Degraded|Offln|Offline|Partially|Failed' && deg=1
+      # Read the VD's State column ONLY (storcli prints a legend that contains the words
+      # "Degraded/OffLine/..." which must NOT be mistaken for the actual state).
+      local vstate
+      vstate="$(printf '%s\n' "$vdout" | awk '$1 ~ /^[0-9]+\/[0-9]+$/ {print $3; exit}')"
+      [[ -z "$vstate" ]] && vstate="$(printf '%s\n' "$vdout" | sed -nE 's/.*State[[:space:]]*:[[:space:]]*([A-Za-z]+).*/\1/p' | head -1)"
+      case "$vstate" in
+        Optl|Optimal|"")                                     deg=0;;
+        Dgrd|Pdgd|OfLn|Offln|Rec|Degraded|Offline|Partially*|Failed|Fld) deg=1;;
+        *)                                                   deg=0;;
+      esac
       if (( deg )); then
         STATUS_RAID="WARN"; add_warn "Hardware RAID: virtual drive degraded/offline"
-        printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nVirtual drive(s): DEGRADED / OFFLINE' "$ctrl"
+        printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nLevel: %s\nVirtual drive(s): DEGRADED / OFFLINE' "$ctrl" "$RAID_LEVEL"
       else
         STATUS_RAID="PASS"
-        printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nVirtual drive(s): Optimal' "$ctrl"
+        printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nLevel: %s\nVirtual drive(s): Optimal' "$ctrl" "$RAID_LEVEL"
       fi
     else
       echo "(Vendor tool not found: storcli / megacli / perccli - detailed status unavailable)"
       STATUS_RAID="PASS"
-      printf -v SUM_RAID 'Type: Hardware RAID\nController: %s' "$ctrl"
+      printf -v SUM_RAID 'Type: Hardware RAID\nController: %s\nLevel: %s' "$ctrl" "$RAID_LEVEL"
     fi
     return
   fi
 
   # 3) None present
   echo "No RAID detected (software or hardware)."
-  STATUS_RAID="SKIP"
+  STATUS_RAID="SKIP"; RAID_KIND="None"; RAID_LEVEL="n/a"
   SUM_RAID="No RAID detected (software or hardware)"
 }
 
@@ -472,6 +700,11 @@ print_network() {
 
   Q_IPV4="${ipv4_cidr%/*}"
   [[ -z "$Q_IPV4" ]] && Q_IPV4="n/a"
+
+  # Save for the inventory section
+  NET_IPV4="${ipv4_cidr:-n/a}"
+  NET_GW="${gw4:-n/a}"
+  NET_DNS="${dns_list:-n/a}"
 
   echo
   echo "--- DNS ---"; echo "${dns_list:-not found}"
